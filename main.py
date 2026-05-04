@@ -9,16 +9,18 @@ import threading
 import time
 import traceback
 import urllib.request
+import uuid
 from urllib.parse import quote, urlparse
 
 import shogi
 from dotenv import load_dotenv
-from flask import Flask, abort, request
+from flask import Flask, abort, request, send_from_directory
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
     ApiClient,
     Configuration,
+    ImageMessage,
     MessagingApi,
     PushMessageRequest,
     ReplyMessageRequest,
@@ -52,6 +54,13 @@ CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH")
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 LAST_KIF_HASH_PATH = os.getenv("LAST_KIF_HASH_PATH", ".last_kif_hash")
 CLIPBOARD_WAIT_SECONDS = float(os.getenv("CLIPBOARD_WAIT_SECONDS", "5"))
+LINE_PUBLIC_BASE_URL = (
+    os.getenv("LINE_PUBLIC_BASE_URL")
+    or os.getenv("PUBLIC_BASE_URL")
+    or os.getenv("NGROK_URL")
+)
+ANALYSIS_IMAGE_DIR = os.getenv("ANALYSIS_IMAGE_DIR", "analysis-images")
+LISHOGI_ANALYSIS_WAIT_SECONDS = float(os.getenv("LISHOGI_ANALYSIS_WAIT_SECONDS", "180"))
 
 CHROME_BINARY_CANDIDATES = (
     "google-chrome",
@@ -74,6 +83,9 @@ KISHIN_URL_RE = re.compile(
 )
 SHOGIWARS_GAME_URL_RE = re.compile(
     r"(?:https?://)?shogiwars\.heroz\.jp/games/[A-Za-z0-9_-]+"
+)
+LISHOGI_URL_RE = re.compile(
+    r"(?:https?://)?lishogi\.org/[A-Za-z0-9][A-Za-z0-9/_#?=&.%+-]*"
 )
 
 CLIPBOARD_SENTINEL = "__KISHIN_DISCORD_BOT_EMPTY_CLIPBOARD__"
@@ -162,6 +174,31 @@ def extract_shogiwars_game_url(text: str) -> str | None:
         url = f"https://{url}"
 
     if not is_shogiwars_game_url(url):
+        return None
+
+    return url
+
+
+def is_lishogi_url(url: str) -> bool:
+    if not re.match(r"https?://", url):
+        url = f"https://{url}"
+
+    parsed = urlparse(url)
+    return parsed.scheme in ("http", "https") and parsed.netloc == "lishogi.org"
+
+
+def extract_lishogi_url(text: str) -> str | None:
+    match = LISHOGI_URL_RE.search(text)
+    if not match:
+        return None
+
+    url = match.group(0).strip()
+    url = url.rstrip(".,縲√・・云・ｽ>")
+
+    if not re.match(r"https?://", url):
+        url = f"https://{url}"
+
+    if not is_lishogi_url(url):
         return None
 
     return url
@@ -1183,6 +1220,161 @@ def import_kif_to_lishogi(driver, kif_text: str) -> str:
     return lishogi_url
 
 
+def click_lishogi_analysis_button(driver) -> bool:
+    button_xpaths = [
+        "//*[self::button or @role='button' or self::a][contains(normalize-space(), 'Request a computer analysis')]",
+        "//*[self::button or @role='button' or self::a][contains(normalize-space(), 'Request computer analysis')]",
+        "//*[self::button or @role='button' or self::a][contains(normalize-space(), 'Computer analysis')]",
+        "//*[self::button or @role='button' or self::a][contains(normalize-space(), 'コンピュータ解析')]",
+        "//*[self::button or @role='button' or self::a][contains(normalize-space(), '解析をリクエスト')]",
+        "//*[self::button or @role='button' or self::a][contains(normalize-space(), '解析')]",
+    ]
+
+    for xpath in button_xpaths:
+        for button in driver.find_elements(By.XPATH, xpath):
+            try:
+                if button.is_displayed() and button.is_enabled():
+                    ActionChains(driver).move_to_element(button).click().perform()
+                    print(f"lishogi analysis button clicked: {xpath}")
+                    return True
+            except (StaleElementReferenceException, WebDriverException):
+                continue
+
+    clicked = driver.execute_script(
+        """
+        const needles = [
+            'request a computer analysis',
+            'request computer analysis',
+            'computer analysis',
+            'コンピュータ解析',
+            '解析をリクエスト',
+        ];
+        const elements = Array.from(document.querySelectorAll(
+            'button, [role="button"], a, input[type="button"], input[type="submit"]'
+        ));
+        for (const element of elements) {
+            const label = [
+                element.innerText || '',
+                element.value || '',
+                element.getAttribute('aria-label') || '',
+                element.title || '',
+            ].join(' ').trim().toLowerCase();
+            const rect = element.getBoundingClientRect();
+            if (!rect.width || !rect.height) continue;
+            if (needles.some((needle) => label.includes(needle.toLowerCase()))) {
+                element.scrollIntoView({ block: 'center', inline: 'center' });
+                element.click();
+                return true;
+            }
+        }
+        return false;
+        """
+    )
+    if clicked:
+        print("lishogi analysis button clicked by JavaScript search.")
+    return bool(clicked)
+
+
+def lishogi_analysis_is_ready(driver) -> bool:
+    return bool(
+        driver.execute_script(
+            """
+            const body = document.body.innerText || '';
+            if (/in progress|進行中|解析中|queued|待機/i.test(body)) return false;
+            if (/request (a )?computer analysis|解析をリクエスト/i.test(body)) return false;
+
+            const graphSelectors = [
+                '.acpl-chart',
+                '.analyse__chart',
+                '.analyse__underboard svg',
+                '.analyse__underboard canvas',
+                'svg',
+                'canvas',
+            ];
+            for (const selector of graphSelectors) {
+                for (const element of document.querySelectorAll(selector)) {
+                    const rect = element.getBoundingClientRect();
+                    if (rect.width >= 240 && rect.height >= 80) return true;
+                }
+            }
+            return /accuracy|centipawn|評価値|悪手|疑問手|好手|inaccuracy|mistake|blunder/i.test(body);
+            """
+        )
+    )
+
+
+def find_lishogi_graph_element(driver):
+    selectors = [
+        ".acpl-chart",
+        ".analyse__chart",
+        ".analyse__underboard .chart",
+        ".analyse__underboard svg",
+        ".analyse__underboard canvas",
+        "svg",
+        "canvas",
+        ".analyse__underboard",
+    ]
+
+    for selector in selectors:
+        elements = driver.find_elements(By.CSS_SELECTOR, selector)
+        visible = []
+        for element in elements:
+            try:
+                if element.is_displayed() and element.rect["width"] >= 240 and element.rect["height"] >= 80:
+                    visible.append(element)
+            except (StaleElementReferenceException, WebDriverException):
+                continue
+        if visible:
+            return max(visible, key=lambda e: e.rect["width"] * e.rect["height"])
+
+    return None
+
+
+def save_lishogi_analysis_graph(driver, lishogi_url: str) -> str:
+    login_to_lishogi(driver)
+
+    print("lishogi analysis page を開いています...")
+    driver.get(lishogi_url)
+    wait = WebDriverWait(driver, 30)
+    wait.until(lambda d: find_visible(d, By.CSS_SELECTOR, "body") is not None)
+
+    click_lishogi_analysis_button(driver)
+
+    print("lishogi のコンピュータ解析完了を待っています...")
+    WebDriverWait(driver, LISHOGI_ANALYSIS_WAIT_SECONDS).until(lishogi_analysis_is_ready)
+    time.sleep(1)
+
+    graph = find_lishogi_graph_element(driver)
+    if graph is None:
+        raise RuntimeError("lishogiの解析グラフが見つかりませんでした。")
+
+    os.makedirs(ANALYSIS_IMAGE_DIR, exist_ok=True)
+    image_filename = f"lishogi-analysis-{uuid.uuid4().hex}.png"
+    image_path = os.path.join(ANALYSIS_IMAGE_DIR, image_filename)
+
+    driver.execute_script(
+        "arguments[0].scrollIntoView({ block: 'center', inline: 'center' });",
+        graph,
+    )
+    time.sleep(0.5)
+    graph.screenshot(image_path)
+    print("lishogi analysis graph screenshot:", image_path)
+    return image_path
+
+
+def lishogi_url_to_analysis_graph(url: str) -> str:
+    driver = make_driver()
+
+    try:
+        return save_lishogi_analysis_graph(driver, url)
+
+    finally:
+        user_data_dir = getattr(driver, "_kishin_user_data_dir", None)
+        driver.quit()
+        if user_data_dir:
+            shutil.rmtree(user_data_dir, ignore_errors=True)
+
+
 def make_driver():
     options = Options()
     user_data_dir = tempfile.mkdtemp(prefix="kishin-chrome-")
@@ -1263,6 +1455,22 @@ def kishin_url_to_lishogi_url(url: str) -> str:
             shutil.rmtree(user_data_dir, ignore_errors=True)
 
 
+def kishin_url_to_lishogi_result(url: str) -> tuple[str, str | None]:
+    driver = make_driver()
+
+    try:
+        kif_text = get_kif_from_kishin(driver, url)
+        lishogi_url = import_kif_to_lishogi(driver, kif_text)
+        graph_path = save_lishogi_analysis_graph(driver, lishogi_url)
+        return lishogi_url, graph_path
+
+    finally:
+        user_data_dir = getattr(driver, "_kishin_user_data_dir", None)
+        driver.quit()
+        if user_data_dir:
+            shutil.rmtree(user_data_dir, ignore_errors=True)
+
+
 def shogi_extend_to_lishogi_url(user_id: str) -> str:
     """
     shogi-extend検索 → 一番上のコピーでKIF取得 → lishogiインポート → lishogi URL返却
@@ -1291,6 +1499,22 @@ def shogiwars_url_to_lishogi_url(url: str) -> str:
         kif_text = get_kif_from_shogiwars(driver, url)
         lishogi_url = import_kif_to_lishogi(driver, kif_text)
         return lishogi_url
+
+    finally:
+        user_data_dir = getattr(driver, "_kishin_user_data_dir", None)
+        driver.quit()
+        if user_data_dir:
+            shutil.rmtree(user_data_dir, ignore_errors=True)
+
+
+def shogiwars_url_to_lishogi_result(url: str) -> tuple[str, str | None]:
+    driver = make_driver()
+
+    try:
+        kif_text = get_kif_from_shogiwars(driver, url)
+        lishogi_url = import_kif_to_lishogi(driver, kif_text)
+        graph_path = save_lishogi_analysis_graph(driver, lishogi_url)
+        return lishogi_url, graph_path
 
     finally:
         user_data_dir = getattr(driver, "_kishin_user_data_dir", None)
@@ -1521,9 +1745,87 @@ def process_line_message(target_id: str, text: str) -> None:
         send_line_push(target_id, f"棋譜の変換に失敗しました: {e}")
 
 
+def line_image_url(image_path: str) -> str:
+    if not LINE_PUBLIC_BASE_URL:
+        raise RuntimeError(
+            "LINE_PUBLIC_BASE_URL, PUBLIC_BASE_URL, or NGROK_URL is required to send analysis images."
+        )
+
+    base_url = LINE_PUBLIC_BASE_URL.rstrip("/")
+    image_name = os.path.basename(image_path)
+    return f"{base_url}/analysis-images/{quote(image_name)}"
+
+
+def send_line_image_push(to: str, image_path: str) -> None:
+    image_url = line_image_url(image_path)
+    with ApiClient(configuration) as api_client:
+        MessagingApi(api_client).push_message(
+            PushMessageRequest(
+                to=to,
+                messages=[
+                    ImageMessage(
+                        originalContentUrl=image_url,
+                        previewImageUrl=image_url,
+                    )
+                ],
+            )
+        )
+
+
+def convert_message_to_lishogi_result(text: str) -> tuple[str, str, str | None] | None:
+    lishogi_url = extract_lishogi_url(text)
+    if lishogi_url:
+        graph_path = lishogi_url_to_analysis_graph(lishogi_url)
+        return ("lishogi", lishogi_url, graph_path)
+
+    shogiwars_url = extract_shogiwars_game_url(text)
+    if shogiwars_url:
+        lishogi_url, graph_path = shogiwars_url_to_lishogi_result(shogiwars_url)
+        return ("Shogi Wars", lishogi_url, graph_path)
+
+    kishin_url = extract_kishin_url(text)
+    if kishin_url:
+        lishogi_url, graph_path = kishin_url_to_lishogi_result(kishin_url)
+        return ("Kishin Analytics", lishogi_url, graph_path)
+
+    return None
+
+
+def process_line_message(target_id: str, text: str) -> None:
+    try:
+        with selenium_lock:
+            result = convert_message_to_lishogi_result(text)
+
+        if result is None:
+            return
+
+        source_name, lishogi_url, graph_path = result
+        send_line_push(
+            target_id,
+            f"{source_name}の棋譜をlishogiに読み込みました。\n{lishogi_url}",
+        )
+        if graph_path:
+            try:
+                send_line_image_push(target_id, graph_path)
+            except Exception as image_error:
+                traceback.print_exc()
+                send_line_push(
+                    target_id,
+                    f"解析グラフ画像の送信に失敗しました: {image_error}",
+                )
+    except Exception as e:
+        traceback.print_exc()
+        send_line_push(target_id, f"棋譜の変換に失敗しました: {e}")
+
+
 @app.get("/")
 def health_check():
     return "OK"
+
+
+@app.get("/analysis-images/<path:filename>")
+def analysis_image(filename: str):
+    return send_from_directory(ANALYSIS_IMAGE_DIR, filename)
 
 
 @app.post("/callback")
@@ -1548,7 +1850,11 @@ def callback():
 def handle_text_message(event: MessageEvent):
     text = event.message.text
     print(f"LINE text message: {text}", flush=True)
-    if not extract_shogiwars_game_url(text) and not extract_kishin_url(text):
+    if (
+        not extract_lishogi_url(text)
+        and not extract_shogiwars_game_url(text)
+        and not extract_kishin_url(text)
+    ):
         print("No supported URL found in LINE text message.", flush=True)
         return
 

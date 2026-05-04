@@ -11,3 +11,6 @@ wheels/
 
 # Environment variables
 .env
+
+# Generated analysis screenshots
+analysis-images/
