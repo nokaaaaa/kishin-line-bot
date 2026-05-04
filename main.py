@@ -56,6 +56,7 @@ LISHOGI_PASSWORD = os.getenv("LISHOGI_PASSWORD")
 USER_ID = os.getenv("USER_ID")
 CHROME_BINARY = os.getenv("CHROME_BINARY")
 CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH")
+CHROME_USER_DATA_DIR = os.getenv("CHROME_USER_DATA_DIR")
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 LAST_KIF_HASH_PATH = os.getenv("LAST_KIF_HASH_PATH", ".last_kif_hash")
 CLIPBOARD_WAIT_SECONDS = float(os.getenv("CLIPBOARD_WAIT_SECONDS", "5"))
@@ -1497,9 +1498,8 @@ def find_lishogi_graph_element(driver):
     return None
 
 
-def save_lishogi_analysis_graph(driver, lishogi_url: str, *, already_logged_in: bool = False) -> str:
-    if not already_logged_in:
-        login_to_lishogi(driver)
+def save_lishogi_analysis_graph(driver, lishogi_url: str) -> str:
+    login_to_lishogi(driver)
 
     print("lishogi analysis page を開いています...")
     driver.get(lishogi_url)
@@ -1556,15 +1556,20 @@ def lishogi_url_to_analysis_graph(url: str) -> str:
         return save_lishogi_analysis_graph(driver, url)
 
     finally:
-        user_data_dir = getattr(driver, "_kishin_user_data_dir", None)
-        driver.quit()
-        if user_data_dir:
-            shutil.rmtree(user_data_dir, ignore_errors=True)
+        close_driver(driver)
 
 
 def make_driver():
     options = Options()
-    user_data_dir = tempfile.mkdtemp(prefix="kishin-chrome-")
+    remove_user_data_dir = False
+    if CHROME_USER_DATA_DIR:
+        user_data_dir = CHROME_USER_DATA_DIR
+        if not os.path.isabs(user_data_dir):
+            user_data_dir = os.path.join(BASE_DIR, user_data_dir)
+        os.makedirs(user_data_dir, exist_ok=True)
+    else:
+        user_data_dir = tempfile.mkdtemp(prefix="kishin-chrome-")
+        remove_user_data_dir = True
 
     options.add_argument("--window-size=1280,900")
     options.add_argument("--window-position=0,0")
@@ -1591,8 +1596,10 @@ def make_driver():
     try:
         driver = webdriver.Chrome(service=service, options=options)
         driver._kishin_user_data_dir = user_data_dir
+        driver._kishin_remove_user_data_dir = remove_user_data_dir
     except WebDriverException as e:
-        shutil.rmtree(user_data_dir, ignore_errors=True)
+        if remove_user_data_dir:
+            shutil.rmtree(user_data_dir, ignore_errors=True)
         driver_path = CHROMEDRIVER_PATH or "Selenium Manager"
         raise RuntimeError(
             "ChromeDriver failed to start.\n"
@@ -1636,10 +1643,7 @@ def kishin_url_to_lishogi_url(url: str) -> str:
         return lishogi_url
 
     finally:
-        user_data_dir = getattr(driver, "_kishin_user_data_dir", None)
-        driver.quit()
-        if user_data_dir:
-            shutil.rmtree(user_data_dir, ignore_errors=True)
+        close_driver(driver)
 
 
 def kishin_url_to_lishogi_result(url: str) -> tuple[str, str | None]:
@@ -1650,16 +1654,13 @@ def kishin_url_to_lishogi_result(url: str) -> tuple[str, str | None]:
         lishogi_url = import_kif_to_lishogi(driver, kif_text)
         graph_path = None
         try:
-            graph_path = save_lishogi_analysis_graph(driver, lishogi_url, already_logged_in=True)
+            graph_path = save_lishogi_analysis_graph(driver, lishogi_url)
         except Exception:
             traceback.print_exc()
         return lishogi_url, graph_path
 
     finally:
-        user_data_dir = getattr(driver, "_kishin_user_data_dir", None)
-        driver.quit()
-        if user_data_dir:
-            shutil.rmtree(user_data_dir, ignore_errors=True)
+        close_driver(driver)
 
 
 def shogi_extend_to_lishogi_url(user_id: str) -> str:
@@ -1674,10 +1675,7 @@ def shogi_extend_to_lishogi_url(user_id: str) -> str:
         return lishogi_url
 
     finally:
-        user_data_dir = getattr(driver, "_kishin_user_data_dir", None)
-        driver.quit()
-        if user_data_dir:
-            shutil.rmtree(user_data_dir, ignore_errors=True)
+        close_driver(driver)
 
 
 def shogiwars_url_to_lishogi_url(url: str) -> str:
@@ -1692,10 +1690,7 @@ def shogiwars_url_to_lishogi_url(url: str) -> str:
         return lishogi_url
 
     finally:
-        user_data_dir = getattr(driver, "_kishin_user_data_dir", None)
-        driver.quit()
-        if user_data_dir:
-            shutil.rmtree(user_data_dir, ignore_errors=True)
+        close_driver(driver)
 
 
 def shogiwars_url_to_lishogi_result(url: str) -> tuple[str, str | None]:
@@ -1706,16 +1701,13 @@ def shogiwars_url_to_lishogi_result(url: str) -> tuple[str, str | None]:
         lishogi_url = import_kif_to_lishogi(driver, kif_text)
         graph_path = None
         try:
-            graph_path = save_lishogi_analysis_graph(driver, lishogi_url, already_logged_in=True)
+            graph_path = save_lishogi_analysis_graph(driver, lishogi_url)
         except Exception:
             traceback.print_exc()
         return lishogi_url, graph_path
 
     finally:
-        user_data_dir = getattr(driver, "_kishin_user_data_dir", None)
-        driver.quit()
-        if user_data_dir:
-            shutil.rmtree(user_data_dir, ignore_errors=True)
+        close_driver(driver)
 
 
 app = Flask(__name__)
@@ -1748,10 +1740,11 @@ def save_last_kif_hash(value: str) -> None:
 
 def close_driver(driver) -> None:
     user_data_dir = getattr(driver, "_kishin_user_data_dir", None)
+    remove_user_data_dir = getattr(driver, "_kishin_remove_user_data_dir", True)
     try:
         driver.quit()
     finally:
-        if user_data_dir:
+        if user_data_dir and remove_user_data_dir:
             shutil.rmtree(user_data_dir, ignore_errors=True)
 
 
@@ -1977,6 +1970,14 @@ def verify_line_image_url(image_url: str) -> None:
 
 def send_line_image_push(to: str, image_path: str) -> None:
     image_url = line_image_url(image_path)
+    print(
+        "line image push:",
+        f"path={os.path.abspath(image_path)}",
+        f"exists={os.path.exists(image_path)}",
+        f"size={os.path.getsize(image_path) if os.path.exists(image_path) else 'missing'}",
+        f"url={image_url}",
+        flush=True,
+    )
     verify_line_image_url(image_url)
     with ApiClient(configuration) as api_client:
         MessagingApi(api_client).push_message(
@@ -2054,7 +2055,15 @@ def health_check():
 
 @app.get("/analysis-images/<path:filename>")
 def analysis_image(filename: str):
-    print(f"analysis image requested: {filename}", flush=True)
+    image_path = os.path.join(ANALYSIS_IMAGE_DIR, filename)
+    print(
+        "analysis image requested:",
+        f"filename={filename}",
+        f"dir={ANALYSIS_IMAGE_DIR}",
+        f"path={image_path}",
+        f"exists={os.path.exists(image_path)}",
+        flush=True,
+    )
     return send_from_directory(ANALYSIS_IMAGE_DIR, filename)
 
 

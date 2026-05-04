@@ -17,5 +17,6 @@ analysis-images/
 
 # Local Selenium inspection scratch
 .selenium-cache/
+.chrome-profile/
 chromedriver/
 lishogi-inspect-*/
