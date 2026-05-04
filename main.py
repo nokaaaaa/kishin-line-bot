@@ -1330,6 +1330,120 @@ def find_lishogi_graph_element(driver):
     return None
 
 
+def open_lishogi_computer_analysis_panel(driver) -> None:
+    tab = find_first_visible_css(
+        driver,
+        [
+            ".analyse__underboard__menu [data-panel='computer-analysis']",
+            ".analyse__underboard__menu .computer-analysis",
+        ],
+    )
+    if tab is not None:
+        driver.execute_script(
+            "arguments[0].scrollIntoView({ block: 'center', inline: 'nearest' });",
+            tab,
+        )
+        time.sleep(0.2)
+        ActionChains(driver).move_to_element(tab).click().perform()
+        return
+
+    opened = driver.execute_script(
+        """
+        const tab =
+            document.querySelector('.analyse__underboard__menu [data-panel="computer-analysis"]') ||
+            document.querySelector('.analyse__underboard__menu .computer-analysis');
+        if (!tab) return false;
+        tab.scrollIntoView({ block: 'center', inline: 'nearest' });
+        tab.click();
+        return true;
+        """
+    )
+    if not opened:
+        raise RuntimeError("lishogi computer analysis tab was not found.")
+
+
+def click_lishogi_analysis_button(driver) -> bool:
+    clicked = driver.execute_script(
+        """
+        const panel =
+            document.querySelector('.analyse__underboard__panels .computer-analysis.active') ||
+            document.querySelector('.analyse__underboard') ||
+            document;
+        const needles = [
+            'request a computer analysis',
+            'request computer analysis',
+            'server analysis',
+            '\\u30b3\\u30f3\\u30d4\\u30e5\\u30fc\\u30bf\\u89e3\\u6790\\u3092\\u30ea\\u30af\\u30a8\\u30b9\\u30c8',
+            '\\u30b3\\u30f3\\u30d4\\u30e5\\u30fc\\u30bf\\u30fc\\u89e3\\u6790\\u3092\\u30ea\\u30af\\u30a8\\u30b9\\u30c8',
+        ];
+        const elements = Array.from(panel.querySelectorAll(
+            'button, [role="button"], a, input[type="button"], input[type="submit"]'
+        ));
+        for (const element of elements) {
+            const label = [
+                element.innerText || '',
+                element.value || '',
+                element.getAttribute('aria-label') || '',
+                element.title || '',
+            ].join(' ').trim().toLowerCase();
+            const rect = element.getBoundingClientRect();
+            if (!rect.width || !rect.height) continue;
+            if (needles.some((needle) => label.includes(needle.toLowerCase()))) {
+                element.scrollIntoView({ block: 'center', inline: 'center' });
+                element.click();
+                return true;
+            }
+        }
+        return false;
+        """
+    )
+    if clicked:
+        print("lishogi server analysis request button clicked.")
+    return bool(clicked)
+
+
+def lishogi_analysis_is_ready(driver) -> bool:
+    return bool(
+        driver.execute_script(
+            """
+            const body = document.body.innerText || '';
+            if (/in progress|queued|waiting|processing/i.test(body)) return false;
+            if (/\\u89e3\\u6790\\u4e2d|\\u5f85\\u6a5f/i.test(body)) return false;
+
+            const activePanel = document.querySelector(
+                '.analyse__underboard__panels .computer-analysis.active'
+            );
+            const chart = document.querySelector('#acpl-chart');
+            const advice = document.querySelector('.analyse__acpl .advice-summary');
+            if (!activePanel || !chart || !advice) return false;
+
+            const rect = chart.getBoundingClientRect();
+            return rect.width >= 240 && rect.height >= 80 && chart.width > 0 && chart.height > 0;
+            """
+        )
+    )
+
+
+def lishogi_server_analysis_exists(driver) -> bool:
+    return lishogi_analysis_is_ready(driver)
+
+
+def find_lishogi_graph_element(driver):
+    for selector in (
+        "#acpl-chart-container",
+        "#acpl-chart",
+        ".analyse__underboard__panels .computer-analysis.active",
+    ):
+        for element in driver.find_elements(By.CSS_SELECTOR, selector):
+            try:
+                rect = element.rect
+                if element.is_displayed() and rect["width"] >= 240 and rect["height"] >= 80:
+                    return element
+            except (StaleElementReferenceException, WebDriverException):
+                continue
+    return None
+
+
 def save_lishogi_analysis_graph(driver, lishogi_url: str) -> str:
     login_to_lishogi(driver)
 
@@ -1338,11 +1452,21 @@ def save_lishogi_analysis_graph(driver, lishogi_url: str) -> str:
     wait = WebDriverWait(driver, 30)
     wait.until(lambda d: find_visible(d, By.CSS_SELECTOR, "body") is not None)
 
-    click_lishogi_analysis_button(driver)
+    open_lishogi_computer_analysis_panel(driver)
+    time.sleep(0.5)
+    if not lishogi_server_analysis_exists(driver):
+        if not click_lishogi_analysis_button(driver):
+            body_preview = driver.find_element(By.TAG_NAME, "body").text[:800]
+            raise RuntimeError(
+                "lishogi server analysis request button was not found. "
+                f"Current URL: {driver.current_url} / Page: {body_preview}"
+            )
 
     print("lishogi のコンピュータ解析完了を待っています...")
+    open_lishogi_computer_analysis_panel(driver)
     WebDriverWait(driver, LISHOGI_ANALYSIS_WAIT_SECONDS).until(lishogi_analysis_is_ready)
     time.sleep(1)
+    open_lishogi_computer_analysis_panel(driver)
 
     graph = find_lishogi_graph_element(driver)
     if graph is None:
