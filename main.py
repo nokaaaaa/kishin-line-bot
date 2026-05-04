@@ -29,8 +29,10 @@ from linebot.v3.messaging import (
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 from selenium import webdriver
 from selenium.common.exceptions import (
+    NoAlertPresentException,
     StaleElementReferenceException,
     TimeoutException,
+    UnexpectedAlertPresentException,
     WebDriverException,
 )
 from selenium.webdriver.chrome.options import Options
@@ -1060,12 +1062,38 @@ def find_first_visible_css(driver, selectors: list[str]):
     return None
 
 
+def lishogi_login_alert_text(driver) -> str | None:
+    try:
+        alert = driver.switch_to.alert
+        text = alert.text
+        alert.accept()
+        return text
+    except NoAlertPresentException:
+        return None
+
+
+def lishogi_logged_in(driver) -> bool:
+    try:
+        driver.get("https://lishogi.org/account")
+        WebDriverWait(driver, 10).until(
+            lambda d: find_visible(d, By.CSS_SELECTOR, "body") is not None
+        )
+        return "/login" not in urlparse(driver.current_url).path
+    except UnexpectedAlertPresentException as e:
+        alert_text = lishogi_login_alert_text(driver) or getattr(e, "alert_text", "")
+        raise RuntimeError(f"lishogi login was rate-limited: {alert_text}") from e
+
+
 def login_to_lishogi(driver) -> None:
     """
     lishogi にログインする。ログイン済みの場合は何もしない。
     """
     if not LISHOGI_USERNAME or not LISHOGI_PASSWORD:
         raise RuntimeError(".env に LISHOGI_USERNAME と LISHOGI_PASSWORD を設定してください。")
+
+    if lishogi_logged_in(driver):
+        print("lishogi はすでにログイン済みです。")
+        return
 
     print("lishogi login page を開いています...")
     driver.get("https://lishogi.org/login")
@@ -1120,7 +1148,11 @@ def login_to_lishogi(driver) -> None:
         visible_password = find_visible(d, By.CSS_SELECTOR, "input[type='password']")
         return current_path != before_path or visible_password is None
 
-    wait.until(login_finished)
+    try:
+        wait.until(login_finished)
+    except UnexpectedAlertPresentException as e:
+        alert_text = lishogi_login_alert_text(driver) or getattr(e, "alert_text", "")
+        raise RuntimeError(f"lishogi login was rate-limited: {alert_text}") from e
 
     if "/login" in urlparse(driver.current_url).path:
         body_text = driver.find_element(By.TAG_NAME, "body").text
@@ -1460,8 +1492,9 @@ def find_lishogi_graph_element(driver):
     return None
 
 
-def save_lishogi_analysis_graph(driver, lishogi_url: str) -> str:
-    login_to_lishogi(driver)
+def save_lishogi_analysis_graph(driver, lishogi_url: str, *, already_logged_in: bool = False) -> str:
+    if not already_logged_in:
+        login_to_lishogi(driver)
 
     print("lishogi analysis page を開いています...")
     driver.get(lishogi_url)
@@ -1612,7 +1645,7 @@ def kishin_url_to_lishogi_result(url: str) -> tuple[str, str | None]:
         lishogi_url = import_kif_to_lishogi(driver, kif_text)
         graph_path = None
         try:
-            graph_path = save_lishogi_analysis_graph(driver, lishogi_url)
+            graph_path = save_lishogi_analysis_graph(driver, lishogi_url, already_logged_in=True)
         except Exception:
             traceback.print_exc()
         return lishogi_url, graph_path
@@ -1668,7 +1701,7 @@ def shogiwars_url_to_lishogi_result(url: str) -> tuple[str, str | None]:
         lishogi_url = import_kif_to_lishogi(driver, kif_text)
         graph_path = None
         try:
-            graph_path = save_lishogi_analysis_graph(driver, lishogi_url)
+            graph_path = save_lishogi_analysis_graph(driver, lishogi_url, already_logged_in=True)
         except Exception:
             traceback.print_exc()
         return lishogi_url, graph_path
