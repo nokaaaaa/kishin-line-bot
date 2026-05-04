@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import traceback
+import urllib.error
 import urllib.request
 import uuid
 from urllib.parse import quote, urlparse
@@ -45,6 +46,8 @@ from selenium.webdriver.support import expected_conditions as EC
 
 load_dotenv()
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 PORT = int(os.getenv("PORT", "5000"))
@@ -62,6 +65,8 @@ LINE_PUBLIC_BASE_URL = (
     or os.getenv("NGROK_URL")
 )
 ANALYSIS_IMAGE_DIR = os.getenv("ANALYSIS_IMAGE_DIR", "analysis-images")
+if not os.path.isabs(ANALYSIS_IMAGE_DIR):
+    ANALYSIS_IMAGE_DIR = os.path.join(BASE_DIR, ANALYSIS_IMAGE_DIR)
 LISHOGI_ANALYSIS_WAIT_SECONDS = float(os.getenv("LISHOGI_ANALYSIS_WAIT_SECONDS", "180"))
 
 CHROME_BINARY_CANDIDATES = (
@@ -1946,8 +1951,33 @@ def line_image_url(image_path: str) -> str:
     return f"{base_url}/analysis-images/{quote(image_name)}"
 
 
+def verify_line_image_url(image_url: str) -> None:
+    request_headers = {
+        "User-Agent": "kishin-line-bot/1.0",
+        "Range": "bytes=0-31",
+    }
+    req = urllib.request.Request(image_url, headers=request_headers)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            content_type = response.headers.get("content-type", "")
+            status = getattr(response, "status", None)
+            header = response.read(16)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"image URL returned HTTP {e.code}: {image_url}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"image URL could not be reached: {image_url} ({e.reason})") from e
+
+    if status not in (200, 206):
+        raise RuntimeError(f"image URL returned HTTP {status}: {image_url}")
+    if not content_type.lower().startswith("image/"):
+        raise RuntimeError(f"image URL returned non-image content-type {content_type!r}: {image_url}")
+    if not (header.startswith(b"\x89PNG\r\n\x1a\n") or header.startswith(b"\xff\xd8\xff")):
+        raise RuntimeError(f"image URL did not return PNG/JPEG bytes: {image_url}")
+
+
 def send_line_image_push(to: str, image_path: str) -> None:
     image_url = line_image_url(image_path)
+    verify_line_image_url(image_url)
     with ApiClient(configuration) as api_client:
         MessagingApi(api_client).push_message(
             PushMessageRequest(
@@ -2024,6 +2054,7 @@ def health_check():
 
 @app.get("/analysis-images/<path:filename>")
 def analysis_image(filename: str):
+    print(f"analysis image requested: {filename}", flush=True)
     return send_from_directory(ANALYSIS_IMAGE_DIR, filename)
 
 
