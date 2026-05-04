@@ -1330,6 +1330,19 @@ def find_lishogi_graph_element(driver):
     return None
 
 
+def has_lishogi_computer_analysis_panel(driver) -> bool:
+    return bool(
+        driver.execute_script(
+            """
+            return Boolean(
+                document.querySelector('.analyse__underboard__menu [data-panel="computer-analysis"]') ||
+                document.querySelector('.analyse__underboard__menu .computer-analysis')
+            );
+            """
+        )
+    )
+
+
 def open_lishogi_computer_analysis_panel(driver) -> None:
     tab = find_first_visible_css(
         driver,
@@ -1359,7 +1372,10 @@ def open_lishogi_computer_analysis_panel(driver) -> None:
         """
     )
     if not opened:
-        raise RuntimeError("lishogi computer analysis tab was not found.")
+        raise RuntimeError(
+            "lishogi computer analysis tab was not found. "
+            "The game may be too short for server analysis."
+        )
 
 
 def click_lishogi_analysis_button(driver) -> bool:
@@ -1451,6 +1467,15 @@ def save_lishogi_analysis_graph(driver, lishogi_url: str) -> str:
     driver.get(lishogi_url)
     wait = WebDriverWait(driver, 30)
     wait.until(lambda d: find_visible(d, By.CSS_SELECTOR, "body") is not None)
+    try:
+        WebDriverWait(driver, 15).until(has_lishogi_computer_analysis_panel)
+    except TimeoutException as e:
+        body_preview = driver.find_element(By.TAG_NAME, "body").text[:800]
+        raise RuntimeError(
+            "lishogi computer analysis tab was not found. "
+            "The game may be too short for server analysis. "
+            f"Current URL: {driver.current_url} / Page: {body_preview}"
+        ) from e
 
     open_lishogi_computer_analysis_panel(driver)
     time.sleep(0.5)
@@ -1585,7 +1610,11 @@ def kishin_url_to_lishogi_result(url: str) -> tuple[str, str | None]:
     try:
         kif_text = get_kif_from_kishin(driver, url)
         lishogi_url = import_kif_to_lishogi(driver, kif_text)
-        graph_path = save_lishogi_analysis_graph(driver, lishogi_url)
+        graph_path = None
+        try:
+            graph_path = save_lishogi_analysis_graph(driver, lishogi_url)
+        except Exception:
+            traceback.print_exc()
         return lishogi_url, graph_path
 
     finally:
@@ -1637,7 +1666,11 @@ def shogiwars_url_to_lishogi_result(url: str) -> tuple[str, str | None]:
     try:
         kif_text = get_kif_from_shogiwars(driver, url)
         lishogi_url = import_kif_to_lishogi(driver, kif_text)
-        graph_path = save_lishogi_analysis_graph(driver, lishogi_url)
+        graph_path = None
+        try:
+            graph_path = save_lishogi_analysis_graph(driver, lishogi_url)
+        except Exception:
+            traceback.print_exc()
         return lishogi_url, graph_path
 
     finally:
@@ -1899,7 +1932,11 @@ def send_line_image_push(to: str, image_path: str) -> None:
 def convert_message_to_lishogi_result(text: str) -> tuple[str, str, str | None] | None:
     lishogi_url = extract_lishogi_url(text)
     if lishogi_url:
-        graph_path = lishogi_url_to_analysis_graph(lishogi_url)
+        graph_path = None
+        try:
+            graph_path = lishogi_url_to_analysis_graph(lishogi_url)
+        except Exception:
+            traceback.print_exc()
         return ("lishogi", lishogi_url, graph_path)
 
     shogiwars_url = extract_shogiwars_game_url(text)
@@ -1937,6 +1974,11 @@ def process_line_message(target_id: str, text: str) -> None:
                     target_id,
                     f"解析グラフ画像の送信に失敗しました: {image_error}",
                 )
+        else:
+            send_line_push(
+                target_id,
+                "解析グラフは作成できませんでした。棋譜が短すぎる、またはlishogi側でサーバー解析をリクエストできない棋譜の可能性があります。",
+            )
     except Exception as e:
         traceback.print_exc()
         send_line_push(target_id, f"棋譜の変換に失敗しました: {e}")
