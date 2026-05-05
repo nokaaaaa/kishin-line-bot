@@ -1092,14 +1092,26 @@ def lishogi_body_preview(driver, limit: int = 800) -> str:
 
 def lishogi_logged_in(driver) -> bool:
     try:
-        driver.get("https://lishogi.org/account")
+        driver.get("https://lishogi.org/api/account")
         WebDriverWait(driver, 10).until(
             lambda d: find_visible(d, By.CSS_SELECTOR, "body") is not None
         )
-        return "/login" not in urlparse(driver.current_url).path
+        body_text = driver.find_element(By.TAG_NAME, "body").text.strip()
+        try:
+            account = json.loads(body_text)
+        except json.JSONDecodeError:
+            print(f"lishogi account check returned non-JSON: {body_text[:200]}")
+            return False
+        logged_in = bool(account.get("id") or account.get("username"))
+        if not logged_in:
+            print(f"lishogi account check did not return a user: {body_text[:200]}")
+        return logged_in
     except UnexpectedAlertPresentException as e:
         alert_text = lishogi_login_alert_text(driver) or getattr(e, "alert_text", "")
         raise RuntimeError(f"lishogi login was rate-limited: {alert_text}") from e
+    except WebDriverException as e:
+        print(f"lishogi account check failed: {e}")
+        return False
 
 
 def login_to_lishogi(driver) -> None:
@@ -1179,6 +1191,12 @@ def login_to_lishogi(driver) -> None:
         raise RuntimeError("lishogi へのログインに失敗しました。ユーザー名またはパスワードを確認してください。")
 
     print("lishogi にログインしました。")
+
+    if not lishogi_logged_in(driver):
+        raise RuntimeError(
+            "lishogi login did not produce an authenticated session. "
+            "Login may be temporarily rate-limited; wait before trying again."
+        )
 
 
 def import_kif_to_lishogi(driver, kif_text: str) -> str:
