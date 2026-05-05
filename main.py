@@ -69,6 +69,10 @@ ANALYSIS_IMAGE_DIR = os.getenv("ANALYSIS_IMAGE_DIR", "analysis-images")
 if not os.path.isabs(ANALYSIS_IMAGE_DIR):
     ANALYSIS_IMAGE_DIR = os.path.join(BASE_DIR, ANALYSIS_IMAGE_DIR)
 LISHOGI_ANALYSIS_WAIT_SECONDS = float(os.getenv("LISHOGI_ANALYSIS_WAIT_SECONDS", "180"))
+LISHOGI_GRAPH_STABLE_SECONDS = float(os.getenv("LISHOGI_GRAPH_STABLE_SECONDS", "3"))
+LISHOGI_GRAPH_STABLE_TIMEOUT_SECONDS = float(
+    os.getenv("LISHOGI_GRAPH_STABLE_TIMEOUT_SECONDS", "30")
+)
 
 CHROME_BINARY_CANDIDATES = (
     "google-chrome",
@@ -1541,6 +1545,71 @@ def find_lishogi_graph_element(driver):
     return None
 
 
+def lishogi_graph_signature(driver):
+    return driver.execute_script(
+        """
+        const chart = document.querySelector('#acpl-chart');
+        const graph =
+            document.querySelector('#acpl-chart-container') ||
+            chart ||
+            document.querySelector('.analyse__underboard__panels .computer-analysis.active');
+        if (!graph) return null;
+
+        const rect = graph.getBoundingClientRect();
+        const chartRect = chart ? chart.getBoundingClientRect() : null;
+        let dataUrl = '';
+        try {
+            if (chart && typeof chart.toDataURL === 'function') {
+                dataUrl = chart.toDataURL('image/png');
+            }
+        } catch (error) {
+            dataUrl = String(error);
+        }
+
+        return {
+            width: Math.round(rect.width),
+            height: Math.round(rect.height),
+            chartWidth: chart ? chart.width : 0,
+            chartHeight: chart ? chart.height : 0,
+            chartCssWidth: chartRect ? Math.round(chartRect.width) : 0,
+            chartCssHeight: chartRect ? Math.round(chartRect.height) : 0,
+            dataLength: dataUrl.length,
+            dataHead: dataUrl.slice(0, 96),
+            dataTail: dataUrl.slice(-96),
+        };
+        """
+    )
+
+
+def wait_for_lishogi_graph_stable(driver):
+    deadline = time.monotonic() + LISHOGI_GRAPH_STABLE_TIMEOUT_SECONDS
+    stable_deadline = None
+    last_signature = None
+
+    while time.monotonic() < deadline:
+        open_lishogi_computer_analysis_panel(driver)
+        WebDriverWait(driver, 5).until(lishogi_analysis_is_ready)
+        signature = lishogi_graph_signature(driver)
+        if signature and signature.get("dataLength", 0) > 1000:
+            comparable = json.dumps(signature, sort_keys=True)
+            if comparable == last_signature:
+                if stable_deadline is None:
+                    stable_deadline = time.monotonic() + LISHOGI_GRAPH_STABLE_SECONDS
+                elif time.monotonic() >= stable_deadline:
+                    print(f"lishogi analysis graph stabilized: {signature}")
+                    return
+            else:
+                last_signature = comparable
+                stable_deadline = None
+        else:
+            last_signature = None
+            stable_deadline = None
+
+        time.sleep(0.5)
+
+    print("lishogi analysis graph did not fully stabilize before timeout; taking screenshot anyway.")
+
+
 def open_lishogi_analysis_page(driver, lishogi_url: str) -> None:
     print("lishogi analysis page を開いています...")
     driver.get(lishogi_url)
@@ -1619,7 +1688,7 @@ def _save_lishogi_analysis_graph_without_alert_retry(driver, lishogi_url: str) -
     print("lishogi のコンピュータ解析完了を待っています...")
     open_lishogi_computer_analysis_panel(driver)
     WebDriverWait(driver, LISHOGI_ANALYSIS_WAIT_SECONDS).until(lishogi_analysis_is_ready)
-    time.sleep(1)
+    wait_for_lishogi_graph_stable(driver)
     open_lishogi_computer_analysis_panel(driver)
 
     graph = find_lishogi_graph_element(driver)
@@ -1663,7 +1732,7 @@ def save_lishogi_analysis_graph(driver, lishogi_url: str) -> str:
         else:
             raise RuntimeError(f"lishogi analysis failed: {alert_text}") from e
 
-    time.sleep(1)
+    wait_for_lishogi_graph_stable(driver)
     open_lishogi_computer_analysis_panel(driver)
 
     graph = find_lishogi_graph_element(driver)
