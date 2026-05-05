@@ -1092,20 +1092,33 @@ def lishogi_body_preview(driver, limit: int = 800) -> str:
 
 def lishogi_logged_in(driver) -> bool:
     try:
-        driver.get("https://lishogi.org/api/account")
+        driver.get("https://lishogi.org/account")
         WebDriverWait(driver, 10).until(
             lambda d: find_visible(d, By.CSS_SELECTOR, "body") is not None
         )
-        body_text = driver.find_element(By.TAG_NAME, "body").text.strip()
-        try:
-            account = json.loads(body_text)
-        except json.JSONDecodeError:
-            print(f"lishogi account check returned non-JSON: {body_text[:200]}")
+        current_path = urlparse(driver.current_url).path
+        if "/login" in current_path:
             return False
-        logged_in = bool(account.get("id") or account.get("username"))
-        if not logged_in:
-            print(f"lishogi account check did not return a user: {body_text[:200]}")
-        return logged_in
+
+        password_input = find_visible(driver, By.CSS_SELECTOR, "input[type='password']")
+        if password_input is not None:
+            return False
+
+        body_text = driver.find_element(By.TAG_NAME, "body").text.strip()
+        login_markers = (
+            "sign in",
+            "log in",
+            "login",
+            "username",
+            "password",
+            "ユーザー名",
+            "パスワード",
+        )
+        if any(marker in body_text.lower() for marker in login_markers):
+            print(f"lishogi account page still looks like login: {body_text[:200]}")
+            return False
+
+        return True
     except UnexpectedAlertPresentException as e:
         alert_text = lishogi_login_alert_text(driver) or getattr(e, "alert_text", "")
         raise RuntimeError(f"lishogi login was rate-limited: {alert_text}") from e
