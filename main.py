@@ -1078,6 +1078,18 @@ def lishogi_login_alert_text(driver) -> str | None:
         return None
 
 
+def lishogi_alert_requires_account(text: str | None) -> bool:
+    return bool(text and "need an account" in text.lower())
+
+
+def lishogi_body_preview(driver, limit: int = 800) -> str:
+    try:
+        return driver.find_element(By.TAG_NAME, "body").text[:limit]
+    except UnexpectedAlertPresentException as e:
+        alert_text = lishogi_login_alert_text(driver) or getattr(e, "alert_text", "")
+        return f"Alert: {alert_text}"
+
+
 def lishogi_logged_in(driver) -> bool:
     try:
         driver.get("https://lishogi.org/account")
@@ -1498,7 +1510,55 @@ def find_lishogi_graph_element(driver):
     return None
 
 
-def save_lishogi_analysis_graph(driver, lishogi_url: str) -> str:
+def open_lishogi_analysis_page(driver, lishogi_url: str) -> None:
+    print("lishogi analysis page を開いています...")
+    driver.get(lishogi_url)
+    WebDriverWait(driver, 30).until(lambda d: find_visible(d, By.CSS_SELECTOR, "body") is not None)
+    try:
+        WebDriverWait(driver, 15).until(has_lishogi_computer_analysis_panel)
+    except TimeoutException as e:
+        body_preview = lishogi_body_preview(driver)
+        raise RuntimeError(
+            "lishogi computer analysis tab was not found. "
+            "The game may be too short for server analysis. "
+            f"Current URL: {driver.current_url} / Page: {body_preview}"
+        ) from e
+
+    open_lishogi_computer_analysis_panel(driver)
+    time.sleep(0.5)
+
+
+def request_lishogi_server_analysis(driver, lishogi_url: str) -> None:
+    for attempt in range(2):
+        alert_text = None
+        try:
+            clicked = click_lishogi_analysis_button(driver)
+            alert_text = lishogi_login_alert_text(driver)
+        except UnexpectedAlertPresentException as e:
+            clicked = True
+            alert_text = lishogi_login_alert_text(driver) or getattr(e, "alert_text", "")
+
+        if alert_text:
+            if lishogi_alert_requires_account(alert_text) and attempt == 0:
+                print("lishogi requested login for server analysis. Re-login and retrying.")
+                login_to_lishogi(driver)
+                open_lishogi_analysis_page(driver, lishogi_url)
+                continue
+            raise RuntimeError(f"lishogi server analysis request failed: {alert_text}")
+
+        if clicked:
+            return
+
+        body_preview = lishogi_body_preview(driver)
+        raise RuntimeError(
+            "lishogi server analysis request button was not found. "
+            f"Current URL: {driver.current_url} / Page: {body_preview}"
+        )
+
+    raise RuntimeError("lishogi server analysis request failed after re-login.")
+
+
+def _save_lishogi_analysis_graph_without_alert_retry(driver, lishogi_url: str) -> str:
     login_to_lishogi(driver)
 
     print("lishogi analysis page を開いています...")
@@ -1534,6 +1594,54 @@ def save_lishogi_analysis_graph(driver, lishogi_url: str) -> str:
     graph = find_lishogi_graph_element(driver)
     if graph is None:
         raise RuntimeError("lishogiの解析グラフが見つかりませんでした。")
+
+    os.makedirs(ANALYSIS_IMAGE_DIR, exist_ok=True)
+    image_filename = f"lishogi-analysis-{uuid.uuid4().hex}.png"
+    image_path = os.path.join(ANALYSIS_IMAGE_DIR, image_filename)
+
+    driver.execute_script(
+        "arguments[0].scrollIntoView({ block: 'center', inline: 'center' });",
+        graph,
+    )
+    time.sleep(0.5)
+    graph.screenshot(image_path)
+    print("lishogi analysis graph screenshot:", image_path)
+    return image_path
+
+
+def save_lishogi_analysis_graph(driver, lishogi_url: str) -> str:
+    login_to_lishogi(driver)
+    open_lishogi_analysis_page(driver, lishogi_url)
+
+    if not lishogi_server_analysis_exists(driver):
+        request_lishogi_server_analysis(driver, lishogi_url)
+
+    print("lishogi のコンピュータ解析完了を待っています...")
+    try:
+        open_lishogi_computer_analysis_panel(driver)
+        WebDriverWait(driver, LISHOGI_ANALYSIS_WAIT_SECONDS).until(lishogi_analysis_is_ready)
+    except UnexpectedAlertPresentException as e:
+        alert_text = lishogi_login_alert_text(driver) or getattr(e, "alert_text", "")
+        if lishogi_alert_requires_account(alert_text):
+            print("lishogi requested login while waiting for analysis. Re-login and retrying.")
+            login_to_lishogi(driver)
+            open_lishogi_analysis_page(driver, lishogi_url)
+            if not lishogi_server_analysis_exists(driver):
+                request_lishogi_server_analysis(driver, lishogi_url)
+            WebDriverWait(driver, LISHOGI_ANALYSIS_WAIT_SECONDS).until(lishogi_analysis_is_ready)
+        else:
+            raise RuntimeError(f"lishogi analysis failed: {alert_text}") from e
+
+    time.sleep(1)
+    open_lishogi_computer_analysis_panel(driver)
+
+    graph = find_lishogi_graph_element(driver)
+    if graph is None:
+        body_preview = lishogi_body_preview(driver)
+        raise RuntimeError(
+            "lishogi analysis graph was not found. "
+            f"Current URL: {driver.current_url} / Page: {body_preview}"
+        )
 
     os.makedirs(ANALYSIS_IMAGE_DIR, exist_ok=True)
     image_filename = f"lishogi-analysis-{uuid.uuid4().hex}.png"
