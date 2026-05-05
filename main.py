@@ -2306,56 +2306,55 @@ def send_line_image_push(to: str, image_path: str) -> None:
         )
 
 
-def convert_message_to_lishogi_result(text: str) -> tuple[str, str, str | None] | None:
+def convert_message_to_lishogi_url_for_line(text: str) -> tuple[str, str] | None:
     lishogi_url = extract_lishogi_url(text)
     if lishogi_url:
-        graph_path = None
-        try:
-            graph_path = lishogi_url_to_analysis_graph(lishogi_url)
-        except Exception:
-            traceback.print_exc()
-        return ("lishogi", lishogi_url, graph_path)
+        return ("lishogi", lishogi_url)
 
     shogiwars_url = extract_shogiwars_game_url(text)
     if shogiwars_url:
-        lishogi_url, graph_path = shogiwars_url_to_lishogi_result(shogiwars_url)
-        return ("Shogi Wars", lishogi_url, graph_path)
+        return ("Shogi Wars", shogiwars_url_to_lishogi_url(shogiwars_url))
 
     kishin_url = extract_kishin_url(text)
     if kishin_url:
-        lishogi_url, graph_path = kishin_url_to_lishogi_result(kishin_url)
-        return ("Kishin Analytics", lishogi_url, graph_path)
+        return ("Kishin Analytics", kishin_url_to_lishogi_url(kishin_url))
 
     return None
+
+
+def send_lishogi_analysis_image_when_ready(target_id: str, lishogi_url: str) -> None:
+    graph_path = None
+    try:
+        with selenium_lock:
+            graph_path = lishogi_url_to_analysis_graph(lishogi_url)
+    except Exception:
+        traceback.print_exc()
+
+    if not graph_path:
+        send_line_push(target_id, "analysis graph could not be created.")
+        return
+
+    try:
+        send_line_image_push(target_id, graph_path)
+    except Exception as image_error:
+        traceback.print_exc()
+        send_line_push(target_id, f"analysis graph image could not be sent: {image_error}")
 
 
 def process_line_message(target_id: str, text: str) -> None:
     try:
         with selenium_lock:
-            result = convert_message_to_lishogi_result(text)
+            result = convert_message_to_lishogi_url_for_line(text)
 
         if result is None:
             return
 
-        source_name, lishogi_url, graph_path = result
+        source_name, lishogi_url = result
         send_line_push(
             target_id,
             f"{source_name}の棋譜をlishogiに読み込みました。\n{lishogi_url}",
         )
-        if graph_path:
-            try:
-                send_line_image_push(target_id, graph_path)
-            except Exception as image_error:
-                traceback.print_exc()
-                send_line_push(
-                    target_id,
-                    f"解析グラフ画像の送信に失敗しました: {image_error}",
-                )
-        else:
-            send_line_push(
-                target_id,
-                "解析グラフは作成できませんでした。棋譜が短すぎる、またはlishogi側でサーバー解析をリクエストできない棋譜の可能性があります。",
-            )
+        send_lishogi_analysis_image_when_ready(target_id, lishogi_url)
     except Exception as e:
         traceback.print_exc()
         send_line_push(target_id, f"棋譜の変換に失敗しました: {e}")
