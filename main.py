@@ -1515,13 +1515,63 @@ def lishogi_analysis_is_ready(driver) -> bool:
                 '.analyse__underboard__panels .computer-analysis.active'
             );
             const chart = document.querySelector('#acpl-chart');
-            const advice = document.querySelector('.analyse__acpl .advice-summary');
-            if (!activePanel || !chart || !advice) return false;
+            if (!activePanel || !chart) return false;
 
             const rect = chart.getBoundingClientRect();
-            return rect.width >= 240 && rect.height >= 80 && chart.width > 0 && chart.height > 0;
+            if (rect.width < 240 || rect.height < 80 || chart.width <= 0 || chart.height <= 0) {
+                return false;
+            }
+
+            try {
+                return chart.toDataURL('image/png').length > 1000;
+            } catch (error) {
+                return true;
+            }
             """
         )
+    )
+
+
+def lishogi_analysis_debug_state(driver):
+    return driver.execute_script(
+        """
+        const body = (document.body.innerText || '').slice(0, 800);
+        const panel = document.querySelector('.analyse__underboard__panels .computer-analysis.active');
+        const chart = document.querySelector('#acpl-chart');
+        const requestButtons = Array.from(document.querySelectorAll('button, [role="button"], a'))
+            .map((element) => [
+                element.innerText || '',
+                element.getAttribute('aria-label') || '',
+                element.title || '',
+            ].join(' ').trim())
+            .filter((text) => /request|analysis|解析/i.test(text))
+            .slice(0, 8);
+        let chartDataLength = 0;
+        let chartRect = null;
+        if (chart) {
+            const rect = chart.getBoundingClientRect();
+            chartRect = {
+                width: Math.round(rect.width),
+                height: Math.round(rect.height),
+                canvasWidth: chart.width,
+                canvasHeight: chart.height,
+            };
+            try {
+                chartDataLength = chart.toDataURL('image/png').length;
+            } catch (error) {
+                chartDataLength = -1;
+            }
+        }
+        return {
+            url: location.href,
+            hasPanel: Boolean(panel),
+            hasChart: Boolean(chart),
+            chartRect,
+            chartDataLength,
+            requestButtons,
+            body,
+        };
+        """
     )
 
 
@@ -1588,7 +1638,9 @@ def wait_for_lishogi_graph_stable(driver):
 
     while time.monotonic() < deadline:
         open_lishogi_computer_analysis_panel(driver)
-        WebDriverWait(driver, 5).until(lishogi_analysis_is_ready)
+        if not lishogi_analysis_is_ready(driver):
+            time.sleep(0.5)
+            continue
         signature = lishogi_graph_signature(driver)
         if signature and signature.get("dataLength", 0) > 1000:
             comparable = json.dumps(signature, sort_keys=True)
@@ -1658,6 +1710,17 @@ def request_lishogi_server_analysis(driver, lishogi_url: str) -> None:
     raise RuntimeError("lishogi server analysis request failed after re-login.")
 
 
+def wait_for_lishogi_analysis_ready(driver) -> None:
+    try:
+        WebDriverWait(driver, LISHOGI_ANALYSIS_WAIT_SECONDS).until(lishogi_analysis_is_ready)
+    except TimeoutException as e:
+        state = lishogi_analysis_debug_state(driver)
+        if state.get("hasChart") and state.get("chartDataLength", 0) > 1000:
+            print(f"lishogi analysis wait timed out, but chart is drawable: {state}")
+            return
+        raise RuntimeError(f"lishogi analysis did not become ready: {state}") from e
+
+
 def _save_lishogi_analysis_graph_without_alert_retry(driver, lishogi_url: str) -> str:
     login_to_lishogi(driver)
 
@@ -1687,7 +1750,7 @@ def _save_lishogi_analysis_graph_without_alert_retry(driver, lishogi_url: str) -
 
     print("lishogi のコンピュータ解析完了を待っています...")
     open_lishogi_computer_analysis_panel(driver)
-    WebDriverWait(driver, LISHOGI_ANALYSIS_WAIT_SECONDS).until(lishogi_analysis_is_ready)
+    wait_for_lishogi_analysis_ready(driver)
     wait_for_lishogi_graph_stable(driver)
     open_lishogi_computer_analysis_panel(driver)
 
@@ -1719,7 +1782,7 @@ def save_lishogi_analysis_graph(driver, lishogi_url: str) -> str:
     print("lishogi のコンピュータ解析完了を待っています...")
     try:
         open_lishogi_computer_analysis_panel(driver)
-        WebDriverWait(driver, LISHOGI_ANALYSIS_WAIT_SECONDS).until(lishogi_analysis_is_ready)
+        wait_for_lishogi_analysis_ready(driver)
     except UnexpectedAlertPresentException as e:
         alert_text = lishogi_login_alert_text(driver) or getattr(e, "alert_text", "")
         if lishogi_alert_requires_account(alert_text):
@@ -1728,7 +1791,7 @@ def save_lishogi_analysis_graph(driver, lishogi_url: str) -> str:
             open_lishogi_analysis_page(driver, lishogi_url)
             if not lishogi_server_analysis_exists(driver):
                 request_lishogi_server_analysis(driver, lishogi_url)
-            WebDriverWait(driver, LISHOGI_ANALYSIS_WAIT_SECONDS).until(lishogi_analysis_is_ready)
+            wait_for_lishogi_analysis_ready(driver)
         else:
             raise RuntimeError(f"lishogi analysis failed: {alert_text}") from e
 
