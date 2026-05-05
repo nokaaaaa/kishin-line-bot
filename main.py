@@ -1616,6 +1616,32 @@ def lishogi_graph_signature(driver):
             dataUrl = String(error);
         }
 
+        let drawnSamples = 0;
+        let sampleHash = 0;
+        if (chart && chart.width > 0 && chart.height > 0) {
+            try {
+                const context = chart.getContext('2d', { willReadFrequently: true });
+                const stepX = Math.max(1, Math.floor(chart.width / 80));
+                const stepY = Math.max(1, Math.floor(chart.height / 40));
+                const first = context.getImageData(0, 0, 1, 1).data;
+                for (let y = 0; y < chart.height; y += stepY) {
+                    for (let x = 0; x < chart.width; x += stepX) {
+                        const pixel = context.getImageData(x, y, 1, 1).data;
+                        const distance =
+                            Math.abs(pixel[0] - first[0]) +
+                            Math.abs(pixel[1] - first[1]) +
+                            Math.abs(pixel[2] - first[2]) +
+                            Math.abs(pixel[3] - first[3]);
+                        if (distance > 24 && pixel[3] > 0) drawnSamples += 1;
+                        sampleHash = ((sampleHash * 31) + pixel[0] + pixel[1] * 3 + pixel[2] * 7 + pixel[3] * 11) >>> 0;
+                    }
+                }
+            } catch (error) {
+                drawnSamples = -1;
+                sampleHash = dataUrl.length;
+            }
+        }
+
         return {
             width: Math.round(rect.width),
             height: Math.round(rect.height),
@@ -1626,8 +1652,18 @@ def lishogi_graph_signature(driver):
             dataLength: dataUrl.length,
             dataHead: dataUrl.slice(0, 96),
             dataTail: dataUrl.slice(-96),
+            drawnSamples,
+            sampleHash,
         };
         """
+    )
+
+
+def lishogi_graph_has_drawn_pixels(signature) -> bool:
+    return (
+        bool(signature)
+        and signature.get("dataLength", 0) > 1000
+        and signature.get("drawnSamples", 0) >= 8
     )
 
 
@@ -1635,6 +1671,7 @@ def wait_for_lishogi_graph_stable(driver):
     deadline = time.monotonic() + LISHOGI_GRAPH_STABLE_TIMEOUT_SECONDS
     stable_deadline = None
     last_signature = None
+    last_seen_signature = None
 
     while time.monotonic() < deadline:
         open_lishogi_computer_analysis_panel(driver)
@@ -1642,7 +1679,8 @@ def wait_for_lishogi_graph_stable(driver):
             time.sleep(0.5)
             continue
         signature = lishogi_graph_signature(driver)
-        if signature and signature.get("dataLength", 0) > 1000:
+        last_seen_signature = signature
+        if lishogi_graph_has_drawn_pixels(signature):
             comparable = json.dumps(signature, sort_keys=True)
             if comparable == last_signature:
                 if stable_deadline is None:
@@ -1659,7 +1697,19 @@ def wait_for_lishogi_graph_stable(driver):
 
         time.sleep(0.5)
 
-    print("lishogi analysis graph did not fully stabilize before timeout; taking screenshot anyway.")
+    raise RuntimeError(f"lishogi analysis graph did not finish drawing: {last_seen_signature}")
+
+
+def scroll_lishogi_graph_into_view_and_wait(driver, graph) -> None:
+    driver.execute_script(
+        """
+        const done = arguments[arguments.length - 1];
+        arguments[0].scrollIntoView({ block: 'center', inline: 'center' });
+        requestAnimationFrame(() => requestAnimationFrame(done));
+        """,
+        graph,
+    )
+    wait_for_lishogi_graph_stable(driver)
 
 
 def open_lishogi_analysis_page(driver, lishogi_url: str) -> None:
@@ -1762,11 +1812,7 @@ def _save_lishogi_analysis_graph_without_alert_retry(driver, lishogi_url: str) -
     image_filename = f"lishogi-analysis-{uuid.uuid4().hex}.png"
     image_path = os.path.join(ANALYSIS_IMAGE_DIR, image_filename)
 
-    driver.execute_script(
-        "arguments[0].scrollIntoView({ block: 'center', inline: 'center' });",
-        graph,
-    )
-    time.sleep(0.5)
+    scroll_lishogi_graph_into_view_and_wait(driver, graph)
     graph.screenshot(image_path)
     print("lishogi analysis graph screenshot:", image_path)
     return image_path
@@ -1810,11 +1856,7 @@ def save_lishogi_analysis_graph(driver, lishogi_url: str) -> str:
     image_filename = f"lishogi-analysis-{uuid.uuid4().hex}.png"
     image_path = os.path.join(ANALYSIS_IMAGE_DIR, image_filename)
 
-    driver.execute_script(
-        "arguments[0].scrollIntoView({ block: 'center', inline: 'center' });",
-        graph,
-    )
-    time.sleep(0.5)
+    scroll_lishogi_graph_into_view_and_wait(driver, graph)
     graph.screenshot(image_path)
     print("lishogi analysis graph screenshot:", image_path)
     return image_path
@@ -2264,56 +2306,55 @@ def send_line_image_push(to: str, image_path: str) -> None:
         )
 
 
-def convert_message_to_lishogi_result(text: str) -> tuple[str, str, str | None] | None:
+def convert_message_to_lishogi_url_for_line(text: str) -> tuple[str, str] | None:
     lishogi_url = extract_lishogi_url(text)
     if lishogi_url:
-        graph_path = None
-        try:
-            graph_path = lishogi_url_to_analysis_graph(lishogi_url)
-        except Exception:
-            traceback.print_exc()
-        return ("lishogi", lishogi_url, graph_path)
+        return ("lishogi", lishogi_url)
 
     shogiwars_url = extract_shogiwars_game_url(text)
     if shogiwars_url:
-        lishogi_url, graph_path = shogiwars_url_to_lishogi_result(shogiwars_url)
-        return ("Shogi Wars", lishogi_url, graph_path)
+        return ("Shogi Wars", shogiwars_url_to_lishogi_url(shogiwars_url))
 
     kishin_url = extract_kishin_url(text)
     if kishin_url:
-        lishogi_url, graph_path = kishin_url_to_lishogi_result(kishin_url)
-        return ("Kishin Analytics", lishogi_url, graph_path)
+        return ("Kishin Analytics", kishin_url_to_lishogi_url(kishin_url))
 
     return None
+
+
+def send_lishogi_analysis_image_when_ready(target_id: str, lishogi_url: str) -> None:
+    graph_path = None
+    try:
+        with selenium_lock:
+            graph_path = lishogi_url_to_analysis_graph(lishogi_url)
+    except Exception:
+        traceback.print_exc()
+
+    if not graph_path:
+        send_line_push(target_id, "analysis graph could not be created.")
+        return
+
+    try:
+        send_line_image_push(target_id, graph_path)
+    except Exception as image_error:
+        traceback.print_exc()
+        send_line_push(target_id, f"analysis graph image could not be sent: {image_error}")
 
 
 def process_line_message(target_id: str, text: str) -> None:
     try:
         with selenium_lock:
-            result = convert_message_to_lishogi_result(text)
+            result = convert_message_to_lishogi_url_for_line(text)
 
         if result is None:
             return
 
-        source_name, lishogi_url, graph_path = result
+        source_name, lishogi_url = result
         send_line_push(
             target_id,
             f"{source_name}の棋譜をlishogiに読み込みました。\n{lishogi_url}",
         )
-        if graph_path:
-            try:
-                send_line_image_push(target_id, graph_path)
-            except Exception as image_error:
-                traceback.print_exc()
-                send_line_push(
-                    target_id,
-                    f"解析グラフ画像の送信に失敗しました: {image_error}",
-                )
-        else:
-            send_line_push(
-                target_id,
-                "解析グラフは作成できませんでした。棋譜が短すぎる、またはlishogi側でサーバー解析をリクエストできない棋譜の可能性があります。",
-            )
+        send_lishogi_analysis_image_when_ready(target_id, lishogi_url)
     except Exception as e:
         traceback.print_exc()
         send_line_push(target_id, f"棋譜の変換に失敗しました: {e}")
